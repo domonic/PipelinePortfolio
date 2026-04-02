@@ -1,0 +1,105 @@
+name: Reusable - Docker Build & Push to ECR
+
+on:
+  workflow_call:
+    inputs:
+      context:
+        description: "Docker build context path"
+        required: true
+        type: string
+      ecr_repository:
+        description: "ECR repository name"
+        required: true
+        type: string
+      aws_region:
+        description: "AWS region"
+        required: false
+        type: string
+        default: "us-east-1"
+      dockerfile:
+        description: "Path to Dockerfile relative to context"
+        required: false
+        type: string
+        default: "Dockerfile"
+      trivy_severity:
+        description: "Trivy severity threshold"
+        required: false
+        type: string
+        default: "CRITICAL,HIGH"
+      trivy_exit_code:
+        description: "Trivy exit code on findings (0=warn, 1=fail)"
+        required: false
+        type: string
+        default: "1"
+    secrets:
+      AWS_ROLE_ARN:
+        required: true
+    outputs:
+      image_tag:
+        description: "The image tag that was pushed"
+        value: ${{ jobs.build.outputs.image_tag }}
+      image_uri:
+        description: "Full image URI"
+        value: ${{ jobs.build.outputs.image_uri }}
+
+jobs:
+  build:
+    name: Build, Scan & Push
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    outputs:
+      image_tag: ${{ steps.meta.outputs.tag }}
+      image_uri: ${{ steps.meta.outputs.uri }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ inputs.aws_region }}
+
+      - name: Login to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set image metadata
+        id: meta
+        run: |
+          TAG="${GITHUB_SHA::8}"
+          URI="${{ steps.ecr.outputs.registry }}/${{ inputs.ecr_repository }}:${TAG}"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "uri=${URI}" >> "$GITHUB_OUTPUT"
+          echo "registry=${{ steps.ecr.outputs.registry }}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.context }}/${{ inputs.dockerfile }}
+          push: false
+          load: true
+          tags: |
+            ${{ steps.meta.outputs.uri }}
+            ${{ steps.meta.outputs.registry }}/${{ inputs.ecr_repository }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Trivy vulnerability scan
+        uses: aquasecurity/trivy-action@v0.29.0
+        with:
+          image-ref: ${{ steps.meta.outputs.uri }}
+          format: "table"
+          exit-code: ${{ inputs.trivy_exit_code }}
+          severity: ${{ inputs.trivy_severity }}
+          ignore-unfixed: true
+
+      - name: Push to ECR
+        run: |
+          docker push ${{ steps.meta.outputs.uri }}
+          docker push ${{ steps.meta.outputs.registry }}/${{ inputs.ecr_repository }}:latest

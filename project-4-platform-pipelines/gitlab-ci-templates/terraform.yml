@@ -1,0 +1,60 @@
+# GitLab CI reusable template: Terraform Plan & Apply
+#
+# Required variables:
+#   TF_DIR      - path to Terraform configuration
+#   ENVIRONMENT - target environment name
+#
+# Optional variables:
+#   TF_VERSION  - Terraform version (default: 1.9.0)
+
+.terraform-plan:
+  image:
+    name: hashicorp/terraform:1.9.0
+    entrypoint: [""]
+  variables:
+    TF_IN_AUTOMATION: "true"
+  script:
+    - cd ${TF_DIR}
+    - terraform init
+    - terraform validate
+    - terraform plan
+        -var-file=environments/${ENVIRONMENT}.tfvars
+        -out=tfplan
+        -no-color 2>&1 | tee plan-output.txt
+  artifacts:
+    paths:
+      - ${TF_DIR}/tfplan
+      - ${TF_DIR}/plan-output.txt
+    expire_in: 1 day
+
+.terraform-apply:
+  image:
+    name: hashicorp/terraform:1.9.0
+    entrypoint: [""]
+  variables:
+    TF_IN_AUTOMATION: "true"
+  script:
+    - cd ${TF_DIR}
+    - terraform init
+    - terraform apply -auto-approve tfplan
+
+.terraform-drift-check:
+  image:
+    name: hashicorp/terraform:1.9.0
+    entrypoint: [""]
+  variables:
+    TF_IN_AUTOMATION: "true"
+  script:
+    - cd ${TF_DIR}
+    - terraform init
+    - terraform plan
+        -var-file=environments/${ENVIRONMENT}.tfvars
+        -detailed-exitcode
+        -no-color 2>&1 | tee drift-output.txt
+    - EXIT_CODE=$?
+    - |
+      if [ "$EXIT_CODE" = "2" ]; then
+        echo "DRIFT DETECTED in ${ENVIRONMENT}"
+        exit 1
+      fi
+      echo "No drift detected"

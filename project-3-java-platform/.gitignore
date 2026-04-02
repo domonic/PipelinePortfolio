@@ -1,0 +1,29 @@
+# Java
+target/
+*.class
+*.jar
+*.war
+.m2/
+
+# IDE
+.idea/
+*.iml
+.vscode/
+.project
+.classpath
+
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.backup
+.terraform.lock.hcl
+
+# Environment
+.env
+.env.local
+
+# OS
+.DS_Store
+
+# Interview prep - keep local only
+INTERVIEW_PREP.md

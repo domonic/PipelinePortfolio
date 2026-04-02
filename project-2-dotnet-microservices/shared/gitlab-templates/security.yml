@@ -1,0 +1,29 @@
+# Reusable security scanning templates
+
+.sonarqube-scan:
+  image: mcr.microsoft.com/dotnet/sdk:8.0
+  stage: scan
+  variables:
+    GIT_DEPTH: "0"
+  before_script:
+    - dotnet tool install --global dotnet-sonarscanner
+    - export PATH="$PATH:$HOME/.dotnet/tools"
+  script:
+    - dotnet sonarscanner begin
+        /k:"${SONAR_PROJECT_KEY}"
+        /d:sonar.host.url="${SONAR_HOST_URL}"
+        /d:sonar.token="${SONAR_TOKEN}"
+        /d:sonar.cs.opencover.reportsPaths="TestResults/**/coverage.opencover.xml"
+        /d:sonar.qualitygate.wait=true
+    - dotnet build ${SERVICE_PATH}/${SERVICE_NAME}/${SERVICE_NAME}.csproj
+    - dotnet sonarscanner end /d:sonar.token="${SONAR_TOKEN}"
+  allow_failure: true
+
+.trivy-filesystem-scan:
+  image:
+    name: aquasec/trivy:latest
+    entrypoint: [""]
+  stage: scan
+  script:
+    - trivy fs --exit-code 1 --severity CRITICAL,HIGH --ignore-unfixed ${SERVICE_PATH}
+  allow_failure: true

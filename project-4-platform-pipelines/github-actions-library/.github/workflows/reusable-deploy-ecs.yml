@@ -1,0 +1,86 @@
+name: Reusable - Deploy to ECS
+
+on:
+  workflow_call:
+    inputs:
+      cluster:
+        description: "ECS cluster name"
+        required: true
+        type: string
+      service:
+        description: "ECS service name"
+        required: true
+        type: string
+      task_definition:
+        description: "Path to task definition JSON"
+        required: true
+        type: string
+      container_name:
+        description: "Container name in task definition"
+        required: true
+        type: string
+      image_uri:
+        description: "Full Docker image URI to deploy"
+        required: true
+        type: string
+      aws_region:
+        description: "AWS region"
+        required: false
+        type: string
+        default: "us-east-1"
+      wait_for_stability:
+        description: "Wait for service stability"
+        required: false
+        type: boolean
+        default: true
+      health_check_url:
+        description: "URL to check after deploy (empty = skip)"
+        required: false
+        type: string
+        default: ""
+    secrets:
+      AWS_ROLE_ARN:
+        required: true
+
+jobs:
+  deploy:
+    name: Deploy to ECS
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ inputs.aws_region }}
+
+      - name: Update task definition
+        id: task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: ${{ inputs.task_definition }}
+          container-name: ${{ inputs.container_name }}
+          image: ${{ inputs.image_uri }}
+
+      - name: Deploy to ECS
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.task-def.outputs.task-definition }}
+          service: ${{ inputs.service }}
+          cluster: ${{ inputs.cluster }}
+          wait-for-service-stability: ${{ inputs.wait_for_stability }}
+
+      - name: Health check
+        if: inputs.health_check_url != ''
+        run: |
+          sleep 30
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" "${{ inputs.health_check_url }}")
+          if [ "$STATUS" != "200" ]; then
+            echo "Health check failed with status $STATUS"
+            exit 1
+          fi
+          echo "Health check passed"

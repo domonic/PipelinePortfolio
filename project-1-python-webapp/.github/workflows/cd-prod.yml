@@ -1,0 +1,187 @@
+name: CD - Deploy to Production
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Image tag to deploy (git SHA prefix)"
+        required: true
+      skip_approval:
+        description: "Skip manual approval (emergency only)"
+        type: boolean
+        default: false
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REGISTRY: ${{ vars.ECR_REGISTRY }}
+  ECS_CLUSTER: project1-prod
+  BACKEND_ECS_SERVICE: project1-backend-prod
+  FRONTEND_ECS_SERVICE: project1-frontend-prod
+
+jobs:
+  approval:
+    name: Production Approval Gate
+    runs-on: ubuntu-latest
+    if: ${{ !inputs.skip_approval }}
+    environment: production
+    steps:
+      - name: Approval checkpoint
+        run: echo "Deployment approved by ${{ github.actor }}"
+
+  deploy-backend:
+    name: Deploy Backend to Prod
+    runs-on: ubuntu-latest
+    needs: approval
+    if: always() && (needs.approval.result == 'success' || inputs.skip_approval)
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_PROD_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Run database migrations
+        run: |
+          pip install -r backend/requirements.txt
+          cd backend && alembic upgrade head
+        env:
+          APP_DATABASE_URL: ${{ secrets.PROD_DATABASE_URL }}
+
+      - name: Update ECS task definition
+        id: task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: infra/task-definitions/backend-prod.json
+          container-name: backend
+          image: "${{ env.ECR_REGISTRY }}/project1-backend:${{ inputs.image_tag }}"
+
+      - name: Deploy to ECS
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.task-def.outputs.task-definition }}
+          service: ${{ env.BACKEND_ECS_SERVICE }}
+          cluster: ${{ env.ECS_CLUSTER }}
+          wait-for-service-stability: true
+
+  deploy-frontend:
+    name: Deploy Frontend to Prod
+    runs-on: ubuntu-latest
+    needs: [approval, deploy-backend]
+    if: always() && (needs.approval.result == 'success' || inputs.skip_approval)
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_PROD_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Update ECS task definition
+        id: task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: infra/task-definitions/frontend-prod.json
+          container-name: frontend
+          image: "${{ env.ECR_REGISTRY }}/project1-frontend:${{ inputs.image_tag }}"
+
+      - name: Deploy to ECS
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.task-def.outputs.task-definition }}
+          service: ${{ env.FRONTEND_ECS_SERVICE }}
+          cluster: ${{ env.ECS_CLUSTER }}
+          wait-for-service-stability: true
+
+  health-check:
+    name: Production Health Check
+    runs-on: ubuntu-latest
+    needs: [deploy-backend, deploy-frontend]
+    steps:
+      - name: Wait for stabilization
+        run: sleep 30
+
+      - name: Check backend health
+        run: |
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" "${{ vars.PROD_BACKEND_URL }}/health")
+          if [ "$STATUS" != "200" ]; then
+            echo "PROD health check FAILED with status $STATUS"
+            exit 1
+          fi
+          echo "Production health check passed"
+
+  rollback:
+    name: Rollback on Failure
+    runs-on: ubuntu-latest
+    needs: health-check
+    if: failure()
+    steps:
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_PROD_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Rollback backend service
+        run: |
+          PREV_TASK=$(aws ecs describe-services \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --services ${{ env.BACKEND_ECS_SERVICE }} \
+            --query 'services[0].deployments[1].taskDefinition' \
+            --output text)
+          aws ecs update-service \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --service ${{ env.BACKEND_ECS_SERVICE }} \
+            --task-definition "$PREV_TASK" \
+            --force-new-deployment
+
+      - name: Rollback frontend service
+        run: |
+          PREV_TASK=$(aws ecs describe-services \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --services ${{ env.FRONTEND_ECS_SERVICE }} \
+            --query 'services[0].deployments[1].taskDefinition' \
+            --output text)
+          aws ecs update-service \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --service ${{ env.FRONTEND_ECS_SERVICE }} \
+            --task-definition "$PREV_TASK" \
+            --force-new-deployment
+
+      - name: Notify rollback
+        uses: slackapi/slack-github-action@v1.27.0
+        with:
+          payload: |
+            {
+              "text": "PROD ROLLBACK triggered for tag ${{ inputs.image_tag }} by ${{ github.actor }}"
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+  notify:
+    name: Notify
+    runs-on: ubuntu-latest
+    needs: [health-check, rollback]
+    if: always()
+    steps:
+      - name: Send Slack notification
+        uses: slackapi/slack-github-action@v1.27.0
+        with:
+          payload: |
+            {
+              "text": "Prod Deploy: ${{ needs.health-check.result == 'success' && 'SUCCESS' || 'FAILED (rollback initiated)' }}\nTag: ${{ inputs.image_tag }}\nBy: ${{ github.actor }}"
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}

@@ -1,0 +1,63 @@
+name: "Docker Build & Push"
+description: "Build Docker image, scan with Trivy, push to ECR"
+
+inputs:
+  context:
+    description: "Docker build context"
+    required: true
+  ecr-repository:
+    description: "ECR repository name"
+    required: true
+  ecr-registry:
+    description: "ECR registry URL"
+    required: true
+  image-tag:
+    description: "Image tag"
+    required: false
+    default: ""
+  trivy-severity:
+    description: "Trivy severity levels"
+    required: false
+    default: "CRITICAL,HIGH"
+
+outputs:
+  image-uri:
+    description: "Full image URI"
+    value: ${{ steps.build.outputs.uri }}
+  image-tag:
+    description: "Image tag used"
+    value: ${{ steps.build.outputs.tag }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Determine tag
+      id: build
+      shell: bash
+      run: |
+        TAG="${{ inputs.image-tag }}"
+        if [ -z "$TAG" ]; then TAG="${GITHUB_SHA::8}"; fi
+        URI="${{ inputs.ecr-registry }}/${{ inputs.ecr-repository }}:${TAG}"
+        echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+        echo "uri=${URI}" >> "$GITHUB_OUTPUT"
+
+    - name: Build image
+      shell: bash
+      run: |
+        docker build -t ${{ steps.build.outputs.uri }} ${{ inputs.context }}
+
+    - name: Trivy scan
+      uses: aquasecurity/trivy-action@v0.29.0
+      with:
+        image-ref: ${{ steps.build.outputs.uri }}
+        format: "table"
+        exit-code: "1"
+        severity: ${{ inputs.trivy-severity }}
+        ignore-unfixed: true
+
+    - name: Push to ECR
+      shell: bash
+      run: docker push ${{ steps.build.outputs.uri }}

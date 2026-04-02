@@ -1,0 +1,10 @@
+# Interview prep files - keep local, never push
+**/INTERVIEW_PREP.md
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/

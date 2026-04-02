@@ -1,0 +1,77 @@
+include:
+  - local: shared/gitlab-templates/dotnet-build.yml
+  - local: shared/gitlab-templates/security.yml
+
+stages:
+  - test
+  - scan
+  - build
+  - deploy
+  - verify
+
+variables:
+  SERVICE_PATH: services/inventory-api
+  SERVICE_NAME: InventoryApi
+  ECR_REPO: project2-inventory-api
+  RELEASE_NAME: inventory-api
+
+test:
+  extends: .dotnet-test
+
+sonarqube:
+  extends: .sonarqube-scan
+  needs: [test]
+  variables:
+    SONAR_PROJECT_KEY: project2-inventory-api
+
+trivy-scan:
+  extends: .trivy-filesystem-scan
+  needs: [test]
+
+build:
+  extends: .docker-build
+  needs: [test]
+  rules:
+    - if: $CI_COMMIT_BRANCH == "develop" || $CI_COMMIT_BRANCH == "main"
+
+deploy-dev:
+  extends: .helm-deploy
+  needs: [build]
+  variables:
+    EKS_CLUSTER: project2-dev
+    K8S_NAMESPACE: inventory-dev
+    IAM_ROLE_ARN: ${INVENTORY_DEV_ROLE_ARN}
+  environment:
+    name: dev/inventory
+    url: https://dev-inventory.example.com
+  rules:
+    - if: $CI_COMMIT_BRANCH == "develop"
+
+deploy-prod:
+  extends: .helm-deploy
+  needs: [build]
+  variables:
+    EKS_CLUSTER: project2-prod
+    K8S_NAMESPACE: inventory-prod
+    IAM_ROLE_ARN: ${INVENTORY_PROD_ROLE_ARN}
+  environment:
+    name: production/inventory
+    url: https://inventory.example.com
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+      when: manual
+
+health-check:
+  stage: verify
+  image: curlimages/curl:latest
+  needs: [deploy-dev]
+  script:
+    - sleep 20
+    - |
+      STATUS=$(curl -s -o /dev/null -w "%{http_code}" "${DEV_INVENTORY_URL}/health")
+      if [ "$STATUS" != "200" ]; then
+        echo "Health check failed: $STATUS"
+        exit 1
+      fi
+  rules:
+    - if: $CI_COMMIT_BRANCH == "develop"

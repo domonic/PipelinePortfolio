@@ -1,0 +1,34 @@
+stages:
+  - trigger
+
+variables:
+  AWS_REGION: us-east-1
+  ECR_REGISTRY: ${ECR_REGISTRY_URL}
+
+# ──────────────────────────────────────────────
+# Monorepo change detection — only build what changed
+# ──────────────────────────────────────────────
+
+orders-api:
+  stage: trigger
+  trigger:
+    include: services/orders-api/.gitlab-ci.yml
+    strategy: depend
+  rules:
+    - changes:
+        - services/orders-api/**/*
+        - shared/**/*
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+    - if: $CI_PIPELINE_SOURCE == "web"
+
+inventory-api:
+  stage: trigger
+  trigger:
+    include: services/inventory-api/.gitlab-ci.yml
+    strategy: depend
+  rules:
+    - changes:
+        - services/inventory-api/**/*
+        - shared/**/*
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+    - if: $CI_PIPELINE_SOURCE == "web"

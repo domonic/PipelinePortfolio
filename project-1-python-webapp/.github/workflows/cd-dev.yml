@@ -1,0 +1,169 @@
+name: CD - Deploy to Dev
+
+on:
+  push:
+    branches: [develop]
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REGISTRY: ${{ vars.ECR_REGISTRY }}
+  ECS_CLUSTER: project1-dev
+
+jobs:
+  build-and-push:
+    name: Build & Push to ECR
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - service: backend
+            ecr_repo: project1-backend
+          - service: frontend
+            ecr_repo: project1-frontend
+    outputs:
+      image_tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set image tag
+        id: meta
+        run: echo "tag=${GITHUB_SHA::8}" >> "$GITHUB_OUTPUT"
+
+      - name: Build Docker image
+        run: |
+          IMAGE="${{ env.ECR_REGISTRY }}/${{ matrix.ecr_repo }}"
+          TAG="${{ steps.meta.outputs.tag }}"
+          docker build -t "${IMAGE}:${TAG}" -t "${IMAGE}:latest" .
+        working-directory: ${{ matrix.service }}
+
+      - name: Trivy vulnerability scan
+        uses: aquasecurity/trivy-action@v0.29.0
+        with:
+          image-ref: "${{ env.ECR_REGISTRY }}/${{ matrix.ecr_repo }}:${{ steps.meta.outputs.tag }}"
+          format: "table"
+          exit-code: "1"
+          severity: "CRITICAL,HIGH"
+          ignore-unfixed: true
+
+      - name: Push Docker image to ECR
+        run: |
+          IMAGE="${{ env.ECR_REGISTRY }}/${{ matrix.ecr_repo }}"
+          TAG="${{ steps.meta.outputs.tag }}"
+          docker push "${IMAGE}:${TAG}"
+          docker push "${IMAGE}:latest"
+
+  run-migrations:
+    name: Run Database Migrations
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+        working-directory: backend
+
+      - name: Run Alembic migrations
+        run: alembic upgrade head
+        working-directory: backend
+        env:
+          APP_DATABASE_URL: ${{ secrets.DEV_DATABASE_URL }}
+
+  deploy:
+    name: Deploy to ECS Dev
+    runs-on: ubuntu-latest
+    needs: [build-and-push, run-migrations]
+    strategy:
+      matrix:
+        include:
+          - service: project1-backend-dev
+            task_def: infra/task-definitions/backend-dev.json
+            container: backend
+            ecr_repo: project1-backend
+          - service: project1-frontend-dev
+            task_def: infra/task-definitions/frontend-dev.json
+            container: frontend
+            ecr_repo: project1-frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Update ECS task definition
+        id: task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: ${{ matrix.task_def }}
+          container-name: ${{ matrix.container }}
+          image: "${{ env.ECR_REGISTRY }}/${{ matrix.ecr_repo }}:${{ needs.build-and-push.outputs.image_tag }}"
+
+      - name: Deploy to ECS
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.task-def.outputs.task-definition }}
+          service: ${{ matrix.service }}
+          cluster: ${{ env.ECS_CLUSTER }}
+          wait-for-service-stability: true
+
+  health-check:
+    name: Post-Deploy Health Check
+    runs-on: ubuntu-latest
+    needs: deploy
+    steps:
+      - name: Wait for service stabilization
+        run: sleep 30
+
+      - name: Check backend health
+        run: |
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" "${{ vars.DEV_BACKEND_URL }}/health")
+          if [ "$STATUS" != "200" ]; then
+            echo "Health check failed with status $STATUS"
+            exit 1
+          fi
+          echo "Health check passed"
+
+  notify:
+    name: Notify
+    runs-on: ubuntu-latest
+    needs: [deploy, health-check]
+    if: always()
+    steps:
+      - name: Send Slack notification
+        uses: slackapi/slack-github-action@v1.27.0
+        with:
+          payload: |
+            {
+              "text": "Dev Deploy: ${{ needs.health-check.result == 'success' && 'SUCCESS' || 'FAILED' }}\nCommit: ${{ github.sha }}\nBy: ${{ github.actor }}"
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}

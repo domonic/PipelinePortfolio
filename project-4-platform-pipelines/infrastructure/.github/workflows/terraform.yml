@@ -1,0 +1,102 @@
+# NOTE: In production, the reusable workflow lives in a separate repo and is
+# referenced as: domonic/pipeline-library/.github/workflows/reusable-terraform.yml@main
+# For this portfolio, the workflow source is in github-actions-library/.github/workflows/
+# and would be published to its own repository for consumption.
+
+name: Infrastructure - Terraform
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "environments/**"
+      - "modules/**"
+  push:
+    branches: [main]
+    paths:
+      - "environments/**"
+      - "modules/**"
+  schedule:
+    - cron: "0 6 * * 1-5"  # Drift check weekdays at 6am UTC
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+
+jobs:
+  # -- DEV ----------------------------------------
+  plan-dev:
+    if: github.event_name == 'pull_request'
+    uses: domonic/pipeline-library/.github/workflows/reusable-terraform.yml@main
+    with:
+      working_directory: environments/dev
+      environment: dev
+      auto_apply: false
+      enable_infracost: true
+      enable_opa: true
+    secrets:
+      AWS_ROLE_ARN: ${{ secrets.AWS_DEV_ROLE_ARN }}
+      INFRACOST_API_KEY: ${{ secrets.INFRACOST_API_KEY }}
+
+  apply-dev:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    uses: domonic/pipeline-library/.github/workflows/reusable-terraform.yml@main
+    with:
+      working_directory: environments/dev
+      environment: dev
+      auto_apply: true
+      enable_opa: true
+    secrets:
+      AWS_ROLE_ARN: ${{ secrets.AWS_DEV_ROLE_ARN }}
+
+  # -- PROD ----------------------------------------
+  plan-prod:
+    if: github.event_name == 'pull_request'
+    uses: domonic/pipeline-library/.github/workflows/reusable-terraform.yml@main
+    with:
+      working_directory: environments/prod
+      environment: prod
+      auto_apply: false
+      enable_infracost: true
+      enable_opa: true
+    secrets:
+      AWS_ROLE_ARN: ${{ secrets.AWS_PROD_ROLE_ARN }}
+      INFRACOST_API_KEY: ${{ secrets.INFRACOST_API_KEY }}
+
+  apply-prod:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [apply-dev]
+    uses: domonic/pipeline-library/.github/workflows/reusable-terraform.yml@main
+    with:
+      working_directory: environments/prod
+      environment: prod
+      auto_apply: true
+      enable_opa: true
+    secrets:
+      AWS_ROLE_ARN: ${{ secrets.AWS_PROD_ROLE_ARN }}
+
+  # -- DRIFT DETECTION -----------------------------
+  drift-dev:
+    if: github.event_name == 'schedule'
+    uses: domonic/pipeline-library/.github/workflows/reusable-terraform.yml@main
+    with:
+      working_directory: environments/dev
+      environment: dev
+      auto_apply: false
+      enable_infracost: false
+      enable_opa: false
+    secrets:
+      AWS_ROLE_ARN: ${{ secrets.AWS_DEV_ROLE_ARN }}
+
+  drift-prod:
+    if: github.event_name == 'schedule'
+    uses: domonic/pipeline-library/.github/workflows/reusable-terraform.yml@main
+    with:
+      working_directory: environments/prod
+      environment: prod
+      auto_apply: false
+      enable_infracost: false
+      enable_opa: false
+    secrets:
+      AWS_ROLE_ARN: ${{ secrets.AWS_PROD_ROLE_ARN }}

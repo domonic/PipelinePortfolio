@@ -1,0 +1,39 @@
+# GitLab CI reusable template: Security Scanning
+#
+# Includes: SonarQube, Trivy filesystem scan, dependency audit
+
+.sonarqube-analysis:
+  variables:
+    GIT_DEPTH: "0"
+  script:
+    - echo "Running SonarQube analysis for ${SONAR_PROJECT_KEY}"
+    # Language-specific setup should be done in before_script
+    - sonar-scanner
+        -Dsonar.host.url=${SONAR_HOST_URL}
+        -Dsonar.token=${SONAR_TOKEN}
+        -Dsonar.projectKey=${SONAR_PROJECT_KEY}
+        -Dsonar.qualitygate.wait=true
+  allow_failure: true
+
+.trivy-fs-scan:
+  image:
+    name: aquasec/trivy:latest
+    entrypoint: [""]
+  script:
+    - trivy fs
+        --exit-code 1
+        --severity CRITICAL,HIGH
+        --ignore-unfixed
+        ${SCAN_PATH:-.}
+  allow_failure: true
+
+.trivy-config-scan:
+  image:
+    name: aquasec/trivy:latest
+    entrypoint: [""]
+  script:
+    - trivy config
+        --exit-code 1
+        --severity CRITICAL,HIGH
+        ${SCAN_PATH:-.}
+  allow_failure: true

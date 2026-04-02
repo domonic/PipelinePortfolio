@@ -1,0 +1,331 @@
+stages:
+  - test
+  - scan
+  - build
+  - migrate
+  - deploy
+  - verify
+  - notify
+
+variables:
+  MAVEN_OPTS: "-Dmaven.repo.local=$CI_PROJECT_DIR/.m2/repository"
+  AWS_REGION: us-east-1
+  ECR_REGISTRY: ${ECR_REGISTRY_URL}
+  ECR_REPO: project4-platform
+  ECS_CLUSTER_DEV: project4-dev
+  ECS_CLUSTER_PROD: project4-prod
+  ECS_SERVICE_DEV: project4-platform-dev
+  ECS_SERVICE_PROD: project4-platform-prod
+  IMAGE_TAG: ${CI_COMMIT_SHORT_SHA}
+
+cache:
+  key: ${CI_COMMIT_REF_SLUG}
+  paths:
+    - .m2/repository/
+    - target/
+
+# ──────────────────────────────────────────────
+# TEST STAGE
+# ──────────────────────────────────────────────
+
+unit-tests:
+  stage: test
+  image: eclipse-temurin:21-jdk-alpine
+  script:
+    - ./mvnw verify -B
+  artifacts:
+    when: always
+    paths:
+      - target/site/jacoco/
+      - target/surefire-reports/
+    reports:
+      junit: target/surefire-reports/TEST-*.xml
+  rules:
+    - if: $CI_MERGE_REQUEST_ID
+    - if: $CI_COMMIT_BRANCH == "develop"
+    - if: $CI_COMMIT_BRANCH == "main"
+
+# ──────────────────────────────────────────────
+# SCAN STAGE
+# ──────────────────────────────────────────────
+
+sonarqube:
+  stage: scan
+  image: eclipse-temurin:21-jdk-alpine
+  needs: [unit-tests]
+  variables:
+    SONAR_USER_HOME: "${CI_PROJECT_DIR}/.sonar"
+    GIT_DEPTH: "0"
+  script:
+    - ./mvnw sonar:sonar
+        -Dsonar.host.url=${SONAR_HOST_URL}
+        -Dsonar.token=${SONAR_TOKEN}
+        -Dsonar.projectKey=project4-platform
+        -Dsonar.qualitygate.wait=true
+        -B
+  allow_failure: true
+  rules:
+    - if: $CI_MERGE_REQUEST_ID
+    - if: $CI_COMMIT_BRANCH == "develop"
+
+owasp-dependency-check:
+  stage: scan
+  image: eclipse-temurin:21-jdk-alpine
+  needs: [unit-tests]
+  script:
+    - ./mvnw dependency-check:check -B
+  artifacts:
+    when: always
+    paths:
+      - target/dependency-check-report.*
+  allow_failure: true
+  rules:
+    - if: $CI_MERGE_REQUEST_ID
+    - if: $CI_COMMIT_BRANCH == "develop"
+    - if: $CI_COMMIT_BRANCH == "main"
+
+# ──────────────────────────────────────────────
+# BUILD STAGE
+# ──────────────────────────────────────────────
+
+build-image:
+  stage: build
+  image: docker:27
+  services:
+    - docker:27-dind
+  needs: [unit-tests]
+  before_script:
+    - apk add --no-cache aws-cli
+    - aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${ECR_REGISTRY}
+  script:
+    - docker build
+        --build-arg APP_VERSION=${CI_COMMIT_SHORT_SHA}
+        --platform linux/amd64
+        -t ${ECR_REGISTRY}/${ECR_REPO}:${IMAGE_TAG}
+        -t ${ECR_REGISTRY}/${ECR_REPO}:latest .
+    # Trivy scan before push
+    - docker run --rm
+        -v /var/run/docker.sock:/var/run/docker.sock
+        aquasec/trivy:latest image
+        --exit-code 1
+        --severity CRITICAL,HIGH
+        --ignore-unfixed
+        ${ECR_REGISTRY}/${ECR_REPO}:${IMAGE_TAG}
+    # Push only if scan passes
+    - docker push ${ECR_REGISTRY}/${ECR_REPO}:${IMAGE_TAG}
+    - docker push ${ECR_REGISTRY}/${ECR_REPO}:latest
+  rules:
+    - if: $CI_COMMIT_BRANCH == "develop"
+    - if: $CI_COMMIT_BRANCH == "main"
+
+# ──────────────────────────────────────────────
+# MIGRATE STAGE
+# ──────────────────────────────────────────────
+
+flyway-migrate-dev:
+  stage: migrate
+  image: flyway/flyway:10
+  needs: [build-image]
+  script:
+    - flyway
+        -url="${DEV_DB_URL}"
+        -user="${DEV_DB_USERNAME}"
+        -password="${DEV_DB_PASSWORD}"
+        -locations="filesystem:src/main/resources/db/migration"
+        migrate
+  rules:
+    - if: $CI_COMMIT_BRANCH == "develop"
+
+flyway-migrate-prod:
+  stage: migrate
+  image: flyway/flyway:10
+  needs: [build-image]
+  script:
+    - flyway
+        -url="${PROD_DB_URL}"
+        -user="${PROD_DB_USERNAME}"
+        -password="${PROD_DB_PASSWORD}"
+        -locations="filesystem:src/main/resources/db/migration"
+        migrate
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+      when: manual
+  allow_failure: false
+
+# ──────────────────────────────────────────────
+# DEPLOY STAGE
+# ──────────────────────────────────────────────
+
+.deploy-template: &deploy-template
+  image:
+    name: amazon/aws-cli:2.17.0
+    entrypoint: [""]
+  script:
+    - |
+      # Register new task definition with updated image
+      TASK_DEF=$(aws ecs describe-task-definition \
+        --task-definition ${TASK_FAMILY} \
+        --query 'taskDefinition' \
+        --output json)
+
+      NEW_TASK_DEF=$(echo $TASK_DEF | \
+        sed "s|\"image\":\"[^\"]*\"|\"image\":\"${ECR_REGISTRY}/${ECR_REPO}:${IMAGE_TAG}\"|g" | \
+        jq 'del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy)')
+
+      NEW_TASK_ARN=$(aws ecs register-task-definition \
+        --cli-input-json "$NEW_TASK_DEF" \
+        --query 'taskDefinition.taskDefinitionArn' \
+        --output text)
+
+      echo "Registered new task definition: $NEW_TASK_ARN"
+
+      # Create CodeDeploy deployment for blue/green
+      DEPLOYMENT_ID=$(aws deploy create-deployment \
+        --application-name ${CODEDEPLOY_APP} \
+        --deployment-group-name ${CODEDEPLOY_GROUP} \
+        --revision "{\"revisionType\":\"AppSpecContent\",\"appSpecContent\":{\"content\":\"{\\\"version\\\":1,\\\"Resources\\\":[{\\\"TargetService\\\":{\\\"Type\\\":\\\"AWS::ECS::Service\\\",\\\"Properties\\\":{\\\"TaskDefinition\\\":\\\"${NEW_TASK_ARN}\\\",\\\"LoadBalancerInfo\\\":{\\\"ContainerName\\\":\\\"app\\\",\\\"ContainerPort\\\":8080}}}}]}\"}}" \
+        --query 'deploymentId' \
+        --output text)
+
+      echo "Created CodeDeploy deployment: $DEPLOYMENT_ID"
+
+      # Wait for deployment to complete
+      aws deploy wait deployment-successful --deployment-id $DEPLOYMENT_ID
+      echo "Deployment successful"
+
+deploy-dev:
+  <<: *deploy-template
+  stage: deploy
+  needs: [flyway-migrate-dev]
+  variables:
+    TASK_FAMILY: project4-platform-dev
+    CODEDEPLOY_APP: project4-dev
+    CODEDEPLOY_GROUP: project4-dev-bg
+  environment:
+    name: dev
+    url: https://dev.project4.example.com
+  rules:
+    - if: $CI_COMMIT_BRANCH == "develop"
+
+deploy-prod:
+  <<: *deploy-template
+  stage: deploy
+  needs: [flyway-migrate-prod]
+  variables:
+    TASK_FAMILY: project4-platform-prod
+    CODEDEPLOY_APP: project4-prod
+    CODEDEPLOY_GROUP: project4-prod-bg
+  environment:
+    name: production
+    url: https://project4.example.com
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+      when: manual
+  allow_failure: false
+
+# ──────────────────────────────────────────────
+# VERIFY STAGE
+# ──────────────────────────────────────────────
+
+health-check-dev:
+  stage: verify
+  image: curlimages/curl:latest
+  needs: [deploy-dev]
+  script:
+    - sleep 30
+    - |
+      STATUS=$(curl -s -o /dev/null -w "%{http_code}" "${DEV_APP_URL}/health")
+      if [ "$STATUS" != "200" ]; then
+        echo "Health check failed with status $STATUS"
+        exit 1
+      fi
+      echo "Health check passed"
+  rules:
+    - if: $CI_COMMIT_BRANCH == "develop"
+
+k6-load-test-dev:
+  stage: verify
+  image:
+    name: grafana/k6:latest
+    entrypoint: [""]
+  needs: [health-check-dev]
+  script:
+    - k6 run k6/load-test.js --env BASE_URL=${DEV_APP_URL}
+  artifacts:
+    when: always
+    paths:
+      - k6/results/
+  allow_failure: true
+  rules:
+    - if: $CI_COMMIT_BRANCH == "develop"
+
+health-check-prod:
+  stage: verify
+  image: curlimages/curl:latest
+  needs: [deploy-prod]
+  script:
+    - sleep 30
+    - |
+      STATUS=$(curl -s -o /dev/null -w "%{http_code}" "${PROD_APP_URL}/health")
+      if [ "$STATUS" != "200" ]; then
+        echo "PRODUCTION health check FAILED with status $STATUS"
+        exit 1
+      fi
+      echo "Production health check passed"
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+
+# ──────────────────────────────────────────────
+# NOTIFY STAGE
+# ──────────────────────────────────────────────
+
+notify-success:
+  stage: notify
+  image: curlimages/curl:latest
+  needs: [health-check-dev]
+  script:
+    - |
+      curl -X POST "${SLACK_WEBHOOK_URL}" \
+        -H 'Content-type: application/json' \
+        -d "{\"text\":\"Dev deploy successful\nProject: project4-platform\nCommit: ${CI_COMMIT_SHORT_SHA}\nBy: ${GITLAB_USER_NAME}\"}"
+  rules:
+    - if: $CI_COMMIT_BRANCH == "develop"
+      when: on_success
+
+notify-failure:
+  stage: notify
+  image: curlimages/curl:latest
+  needs: [health-check-dev]
+  script:
+    - |
+      curl -X POST "${SLACK_WEBHOOK_URL}" \
+        -H 'Content-type: application/json' \
+        -d "{\"text\":\"Dev deploy FAILED\nProject: project4-platform\nCommit: ${CI_COMMIT_SHORT_SHA}\nBy: ${GITLAB_USER_NAME}\"}"
+  rules:
+    - if: $CI_COMMIT_BRANCH == "develop"
+      when: on_failure
+
+notify-prod:
+  stage: notify
+  image: curlimages/curl:latest
+  needs: [health-check-prod]
+  script:
+    - |
+      curl -X POST "${SLACK_WEBHOOK_URL}" \
+        -H 'Content-type: application/json' \
+        -d "{\"text\":\"PRODUCTION deploy complete\nProject: project4-platform\nCommit: ${CI_COMMIT_SHORT_SHA}\nBy: ${GITLAB_USER_NAME}\"}"
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+      when: on_success
+
+# ──────────────────────────────────────────────
+# SCHEDULED JOBS
+# ──────────────────────────────────────────────
+
+nightly-regression:
+  stage: test
+  image: eclipse-temurin:21-jdk-alpine
+  script:
+    - ./mvnw verify -Pintegration-tests -B
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"

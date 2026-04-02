@@ -1,0 +1,55 @@
+# GitLab CI reusable template: Deploy to ECS
+#
+# Required variables:
+#   ECS_CLUSTER    - ECS cluster name
+#   ECS_SERVICE    - ECS service name
+#   TASK_FAMILY    - ECS task definition family
+#   ECR_REPO       - ECR repository name
+#
+# Optional variables:
+#   HEALTH_CHECK_URL - URL to verify after deploy
+
+.deploy-ecs:
+  image:
+    name: amazon/aws-cli:2.17.0
+    entrypoint: [""]
+  script:
+    - IMAGE="${ECR_REGISTRY}/${ECR_REPO}:${CI_COMMIT_SHORT_SHA}"
+    # Get current task definition and update image
+    - |
+      TASK_DEF=$(aws ecs describe-task-definition \
+        --task-definition ${TASK_FAMILY} \
+        --query 'taskDefinition' \
+        --output json)
+
+      NEW_TASK_DEF=$(echo $TASK_DEF | \
+        sed "s|\"image\":\"[^\"]*\"|\"image\":\"${IMAGE}\"|g" | \
+        jq 'del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy)')
+
+      NEW_TASK_ARN=$(aws ecs register-task-definition \
+        --cli-input-json "$NEW_TASK_DEF" \
+        --query 'taskDefinition.taskDefinitionArn' \
+        --output text)
+
+      echo "Registered: $NEW_TASK_ARN"
+
+    - aws ecs update-service
+        --cluster ${ECS_CLUSTER}
+        --service ${ECS_SERVICE}
+        --task-definition ${NEW_TASK_ARN}
+        --force-new-deployment
+
+    - aws ecs wait services-stable
+        --cluster ${ECS_CLUSTER}
+        --services ${ECS_SERVICE}
+
+    - |
+      if [ -n "${HEALTH_CHECK_URL}" ]; then
+        sleep 15
+        STATUS=$(curl -s -o /dev/null -w "%{http_code}" "${HEALTH_CHECK_URL}")
+        if [ "$STATUS" != "200" ]; then
+          echo "Health check failed: $STATUS"
+          exit 1
+        fi
+        echo "Health check passed"
+      fi

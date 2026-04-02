@@ -1,0 +1,45 @@
+{
+  "family": "project4-platform",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "512",
+  "memory": "1024",
+  "executionRoleArn": "arn:aws:iam::ACCOUNT_ID:role/ecsTaskExecutionRole",
+  "taskRoleArn": "arn:aws:iam::ACCOUNT_ID:role/project4-task-role",
+  "containerDefinitions": [
+    {
+      "name": "app",
+      "image": "<IMAGE_PLACEHOLDER>",
+      "portMappings": [
+        { "containerPort": 8080, "protocol": "tcp" }
+      ],
+      "environment": [
+        { "name": "SPRING_PROFILES_ACTIVE", "value": "prod" },
+        { "name": "OTEL_SERVICE_NAME", "value": "project4-platform" },
+        { "name": "OTEL_EXPORTER_OTLP_ENDPOINT", "value": "http://localhost:4317" },
+        { "name": "CLOUDWATCH_METRICS_ENABLED", "value": "true" }
+      ],
+      "secrets": [
+        { "name": "DB_URL", "valueFrom": "arn:aws:secretsmanager:us-east-1:ACCOUNT_ID:secret:project4/db-url" },
+        { "name": "DB_USERNAME", "valueFrom": "arn:aws:secretsmanager:us-east-1:ACCOUNT_ID:secret:project4/db-user" },
+        { "name": "DB_PASSWORD", "valueFrom": "arn:aws:secretsmanager:us-east-1:ACCOUNT_ID:secret:project4/db-pass" },
+        { "name": "REDIS_HOST", "valueFrom": "arn:aws:secretsmanager:us-east-1:ACCOUNT_ID:secret:project4/redis-host" }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/project4-platform",
+          "awslogs-region": "us-east-1",
+          "awslogs-stream-prefix": "ecs"
+        }
+      },
+      "healthCheck": {
+        "command": ["CMD-SHELL", "wget -qO- http://localhost:8080/health || exit 1"],
+        "interval": 30,
+        "timeout": 5,
+        "retries": 3,
+        "startPeriod": 90
+      }
+    }
+  ]
+}

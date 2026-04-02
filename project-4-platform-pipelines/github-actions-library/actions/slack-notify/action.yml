@@ -1,0 +1,55 @@
+name: "Slack Notify"
+description: "Send deployment notification to Slack"
+
+inputs:
+  webhook-url:
+    description: "Slack webhook URL"
+    required: true
+  status:
+    description: "Deployment status (success, failure, rollback)"
+    required: true
+  environment:
+    description: "Target environment"
+    required: true
+  project:
+    description: "Project name"
+    required: true
+  details:
+    description: "Additional details"
+    required: false
+    default: ""
+
+runs:
+  using: "composite"
+  steps:
+    - name: Send notification
+      shell: bash
+      run: |
+        case "${{ inputs.status }}" in
+          success) LABEL="[SUCCESS]"; COLOR="#36a64f" ;;
+          failure) LABEL="[FAILED]"; COLOR="#dc3545" ;;
+          rollback) LABEL="[ROLLBACK]"; COLOR="#ff9900" ;;
+          *) LABEL="[INFO]"; COLOR="#0088cc" ;;
+        esac
+
+        PAYLOAD=$(cat <<EOF
+        {
+          "attachments": [{
+            "color": "${COLOR}",
+            "blocks": [
+              {
+                "type": "section",
+                "text": {
+                  "type": "mrkdwn",
+                  "text": "${LABEL} *${{ inputs.project }}* deploy to *${{ inputs.environment }}*: ${{ inputs.status }}\nCommit: \`${GITHUB_SHA::8}\`\nBy: ${{ github.actor }}\n${{ inputs.details }}"
+                }
+              }
+            ]
+          }]
+        }
+        EOF
+        )
+
+        curl -s -X POST "${{ inputs.webhook-url }}" \
+          -H 'Content-type: application/json' \
+          -d "${PAYLOAD}"
